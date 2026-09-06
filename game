@@ -1,0 +1,457 @@
+from ursina import *
+from ursina.prefabs.first_person_controller import FirstPersonController
+import random
+import math
+import wave
+import struct
+
+# ======================================================
+# PROCEDURAL AUDIO GENERATOR (NO EXTERNAL FILES REQUIRED)
+# ======================================================
+def generate_sound(filename, sound_type):
+    sample_rate = 44100
+    num_samples = int(sample_rate * 0.15)
+    audio = []
+
+    for i in range(num_samples):
+        t = i / sample_rate
+        if sound_type == "shoot":
+            freq = 800 * (1 - t / 0.15)
+            val = math.sin(2 * math.pi * freq * t)
+        elif sound_type == "mine":
+            freq = 150 + random.uniform(-30, 30)
+            val = math.sin(2 * math.pi * freq * t) * (1 - t / 0.15)
+        elif sound_type == "hit":
+            freq = 250
+            val = 0.5 if (int(t * freq * 2) % 2 == 0) else -0.5
+            val *= (1 - t / 0.15)
+        
+        sample = int(max(-1.0, min(1.0, val)) * 32767)
+        audio.append(struct.pack('<h', sample))
+
+    with wave.open(filename, 'wb') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(b''.join(audio))
+
+generate_sound("sfx_shoot.wav", "shoot")
+generate_sound("sfx_mine.wav", "mine")
+generate_sound("sfx_hit.wav", "hit")
+
+
+# ======================================================
+# APPLICATION SETUP
+# ======================================================
+app = Ursina()
+
+window.title = "Alien Survival 3D - Hotbar & Building"
+window.borderless = False
+window.fullscreen = False
+window.exit_button.visible = False
+
+snd_shoot = Audio('sfx_shoot.wav', autoplay=False)
+snd_mine = Audio('sfx_mine.wav', autoplay=False)
+snd_hit = Audio('sfx_hit.wav', autoplay=False)
+
+sky = Sky()
+sky.color = color.rgb(120, 185, 232)
+
+ground = Entity(
+    model='plane',
+    scale=(200, 1, 200),
+    color=color.rgb(80, 160, 60),
+    texture='grass',
+    texture_scale=(100, 100),
+    collider='box'
+)
+
+player = FirstPersonController(
+    position=(0, 2, 10),
+    speed=8,
+    jump_height=1.5
+)
+
+player_stats = {
+    "health": 100,
+    "diamonds": 0,
+    "wood": 0,
+    "blocks": 20,
+    "ammo": 20
+}
+
+# ======================================================
+# BLOCK TYPES & HOTBAR UI
+# ======================================================
+BLOCK_TYPES = [
+    {"name": "Brick", "texture": "brick", "color": color.rgb(180, 110, 70)},
+    {"name": "Stone", "texture": "white_cube", "color": color.gray},
+    {"name": "Wood", "texture": "brick", "color": color.rgb(117, 69, 30)},
+    {"name": "Grass", "texture": "grass", "color": color.rgb(60, 150, 60)},
+]
+
+selected_block_index = 0
+
+# Hotbar Container
+hotbar = Entity(parent=camera.ui, position=(0, -0.42))
+hotbar_slots = []
+hotbar_highlights = []
+
+for i, btype in enumerate(BLOCK_TYPES):
+    x_pos = (i - 1.5) * 0.12
+    
+    # Slot background box
+    slot = Entity(
+        parent=hotbar,
+        model='quad',
+        texture=btype["texture"],
+        color=btype["color"],
+        scale=(0.1, 0.1),
+        position=(x_pos, 0)
+    )
+    
+    # Slot selection highlight border
+    highlight = Entity(
+        parent=hotbar,
+        model='quad',
+        color=color.yellow,
+        scale=(0.115, 0.115),
+        position=(x_pos, 0),
+        z=0.01,
+        visible=(i == 0)
+    )
+    
+    # Number key label
+    Text(
+        text=str(i + 1),
+        parent=slot,
+        position=(-0.4, 0.4),
+        scale=1.5,
+        color=color.white
+    )
+    
+    hotbar_slots.append(slot)
+    hotbar_highlights.append(highlight)
+
+def set_selected_slot(index):
+    global selected_block_index
+    selected_block_index = index % len(BLOCK_TYPES)
+    for i, h in enumerate(hotbar_highlights):
+        h.visible = (i == selected_block_index)
+    show_message(f"Selected: {BLOCK_TYPES[selected_block_index]['name']}")
+
+# Top UI Stats
+ui_text = Text(
+    text='',
+    position=(-0.85, 0.45),
+    scale=1.2,
+    color=color.white
+)
+
+msg_text = Text(
+    text='',
+    origin=(0, 0),
+    scale=2,
+    color=color.yellow,
+    visible=False
+)
+
+def show_message(msg):
+    msg_text.text = msg
+    msg_text.visible = True
+    invoke(setattr, msg_text, 'visible', False, delay=2.0)
+
+def update_ui():
+    ui_text.text = (
+        f"❤️ Health: {max(0, int(player_stats['health']))}  |  💎 Diamonds: {player_stats['diamonds']}\n"
+        f"🪵 Wood: {player_stats['wood']}  |  🧱 Blocks: {player_stats['blocks']}  |  🔫 Ammo: {player_stats['ammo']}"
+    )
+
+trees = []
+diamonds = []
+aliens = []
+bullets = []
+placed_blocks = []
+ufo = None
+dragon = None
+dragon_health = 100
+
+# ======================================================
+# WORLD GENERATION
+# ======================================================
+def create_tree(x, z):
+    trunk = Entity(
+        model='cube',
+        texture='brick',
+        color=color.rgb(117, 69, 30),
+        position=(x, 1.5, z),
+        scale=(1, 3, 1),
+        collider='box'
+    )
+    leaves = Entity(
+        model='cube',
+        texture='grass',
+        color=color.rgb(40, 140, 50),
+        position=(x, 4, z),
+        scale=(3, 3, 3),
+        collider='box'
+    )
+    trees.append((trunk, leaves))
+
+for _ in range(40):
+    rx, rz = random.uniform(-60, 60), random.uniform(-60, 60)
+    if abs(rx) > 8 or abs(rz - 10) > 8:
+        create_tree(rx, rz)
+
+def create_diamond(x, z):
+    d = Entity(
+        model='octahedron',
+        color=color.cyan,
+        position=(x, 0.9, z),
+        scale=1.2
+    )
+    diamonds.append(d)
+
+for _ in range(10):
+    create_diamond(random.uniform(-50, 50), random.uniform(-50, 50))
+
+def spawn_alien():
+    alien = Entity(
+        model='cube',
+        texture='white_cube',
+        color=color.lime,
+        position=(random.uniform(-30, 30), 1, random.uniform(-30, 30)),
+        scale=(1.2, 2, 1.2),
+        collider='box'
+    )
+    Entity(parent=alien, model='cube', color=color.black, position=(-0.25, 0.3, -0.5), scale=0.2)
+    Entity(parent=alien, model='cube', color=color.black, position=(0.25, 0.3, -0.5), scale=0.2)
+    aliens.append(alien)
+
+def spawn_ufo():
+    global ufo
+    if ufo: return
+    ufo = Entity(
+        model='cube',
+        texture='white_cube',
+        color=color.gray,
+        position=(player.x, 15, player.z),
+        scale=(6, 1, 6),
+        collider='box'
+    )
+    Entity(parent=ufo, model='cube', color=color.cyan, position=(0, -0.5, 0), scale=1)
+    show_message("👽 UFO ARRIVED!")
+
+def spawn_dragon():
+    global dragon, dragon_health
+    if dragon: return
+    dragon_health = 100
+    dragon = Entity(
+        model='cube',
+        texture='brick',
+        color=color.rgb(139, 26, 52),
+        position=(player.x, 8, player.z - 25),
+        scale=(3, 2, 5),
+        collider='box'
+    )
+    Entity(parent=dragon, model='cube', color=color.rgb(74, 13, 28), position=(-3, 0.5, 0), scale=(3, 0.2, 2))
+    Entity(parent=dragon, model='cube', color=color.rgb(74, 13, 28), position=(3, 0.5, 0), scale=(3, 0.2, 2))
+    show_message("🐉 THE DRAGON HAS ARRIVED!")
+
+# ======================================================
+# PLAYER CONTROLS & ACTIONS
+# ======================================================
+def input(key):
+    # Hotbar number key selection
+    if key in ('1', '2', '3', '4'):
+        set_selected_slot(int(key) - 1)
+        
+    # Scroll wheel selection
+    if key == 'scroll up':
+        set_selected_slot(selected_block_index - 1)
+    if key == 'scroll down':
+        set_selected_slot(selected_block_index + 1)
+
+    if key == 'left mouse down' or key == 'f':
+        fire_blaster()
+    if key == 'right mouse down' or key == 'e':
+        mine_resource()
+    if key == 'q':
+        build_block()
+    if key == 'c':
+        craft_block()
+
+def mine_resource():
+    for tree in trees[:]:
+        trunk, leaves = tree
+        if distance(player.position, trunk.position) < 4.5:
+            snd_mine.play()
+            destroy(trunk)
+            destroy(leaves)
+            trees.remove(tree)
+            player_stats['wood'] += 2
+            show_message("🪵 +2 WOOD")
+            update_ui()
+            return
+
+    for d in diamonds[:]:
+        if distance(player.position, d.position) < 3.5:
+            snd_mine.play()
+            destroy(d)
+            diamonds.remove(d)
+            player_stats['diamonds'] += 1
+            show_message("💎 DIAMOND COLLECTED!")
+            update_ui()
+            return
+
+def craft_block():
+    if player_stats['wood'] >= 2:
+        player_stats['wood'] -= 2
+        player_stats['blocks'] += 1
+        show_message("🧱 CRAFTED 1 BLOCK")
+    else:
+        show_message("❌ NEED 2 WOOD TO CRAFT")
+    update_ui()
+
+def build_block():
+    if player_stats['blocks'] <= 0:
+        show_message("❌ NO BLOCKS")
+        return
+    
+    snd_mine.play()
+    spawn_pos = player.position + player.forward * 3
+    selected_type = BLOCK_TYPES[selected_block_index]
+    
+    block = Entity(
+        model='cube',
+        texture=selected_type["texture"],
+        color=selected_type["color"],
+        position=(round(spawn_pos.x / 2) * 2, 1, round(spawn_pos.z / 2) * 2),
+        scale=2,
+        collider='box'
+    )
+    placed_blocks.append(block)
+    player_stats['blocks'] -= 1
+    show_message(f"Placed {selected_type['name']} Block")
+    update_ui()
+
+def fire_blaster():
+    if player_stats['ammo'] <= 0:
+        show_message("❌ OUT OF AMMO")
+        return
+
+    snd_shoot.play()
+    player_stats['ammo'] -= 1
+    bullet = Entity(
+        model='sphere',
+        color=color.cyan,
+        position=player.position + Vec3(0, 1.5, 0),
+        scale=0.3
+    )
+    bullet.velocity = player.forward * 40
+    bullets.append(bullet)
+    update_ui()
+
+# ======================================================
+# GAME LOOP
+# ======================================================
+game_time = 0
+alien_timer = 0
+dragon_timer = 0
+is_night = False
+
+def update():
+    global game_time, alien_timer, dragon_timer, is_night, ufo, dragon, dragon_health
+
+    game_time += time.dt * 0.2
+    
+    # Day / Night
+    if math.sin(game_time) < -0.2 and not is_night:
+        is_night = True
+        sky.color = color.rgb(12, 16, 32)
+        for _ in range(3): spawn_alien()
+        show_message("🌙 NIGHT HAS FALLEN!")
+
+    elif math.sin(game_time) > 0.2 and is_night:
+        is_night = False
+        sky.color = color.rgb(120, 185, 232)
+        show_message("☀️ DAYBREAK!")
+
+    # Aliens AI
+    for alien in aliens:
+        dist = distance(player.position, alien.position)
+        if dist > 1.5:
+            alien.look_at(player.position)
+            alien.position += alien.forward * time.dt * 2.5
+        else:
+            player_stats['health'] -= time.dt * 10
+            update_ui()
+
+    # Bullets logic
+    for b in bullets[:]:
+        b.position += b.velocity * time.dt
+        
+        for alien in aliens[:]:
+            if distance(b.position, alien.position) < 1.5:
+                snd_hit.play()
+                destroy(alien)
+                aliens.remove(alien)
+                destroy(b)
+                if b in bullets: bullets.remove(b)
+                show_message("👽 ALIEN DEFEATED!")
+                break
+                
+        if dragon and distance(b.position, dragon.position) < 4:
+            snd_hit.play()
+            dragon_health -= 10
+            destroy(b)
+            if b in bullets: bullets.remove(b)
+            if dragon_health <= 0:
+                destroy(dragon)
+                dragon = None
+                show_message("🏆 DRAGON DEFEATED!")
+
+        if distance(b.position, player.position) > 100:
+            destroy(b)
+            if b in bullets: bullets.remove(b)
+
+    # Event Spawns
+    alien_timer += time.dt
+    if alien_timer > 30:
+        alien_timer = 0
+        spawn_ufo()
+
+    if ufo:
+        if distance(player.position, ufo.position) < 5:
+            player_stats['ammo'] += 10
+            destroy(ufo)
+            ufo = None
+            show_message("🔫 ALIEN ENERGY +10 AMMO")
+            update_ui()
+
+    dragon_timer += time.dt
+    if dragon_timer > 60 and not dragon:
+        dragon_timer = 0
+        spawn_dragon()
+
+    if dragon:
+        dragon.look_at(player.position)
+        dragon.position += dragon.forward * time.dt * 1.5
+
+    # Game Over
+    if player_stats['health'] <= 0:
+        show_message("💀 GAME OVER")
+        player_stats['health'] = 100
+        player.position = (0, 2, 10)
+        update_ui()
+
+Text(
+    text="WASD: Move | Mouse: Look | 1-4 / Scroll: Select Block | Q: Build | C: Craft | Left Click: Shoot | Right Click: Mine",
+    position=(0, -0.48),
+    origin=(0, 0),
+    scale=0.75,
+    color=color.light_gray
+)
+
+update_ui()
+app.run()
